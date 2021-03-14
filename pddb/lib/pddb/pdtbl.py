@@ -63,10 +63,12 @@ class pdtbl(ABC):
         return pd.DataFrame(columns=cols)
 
     def __conv_args(self, *args, **kwargs) -> dict:
-        rtn = {}
+        rtn = []
         for a in args:
             rtn = [a] if isinstance(a, dict) else a
             break
+        if rtn == []:
+            rtn = [kwargs]
         if kwargs != {}:
             nrtn = []
             for r in rtn:

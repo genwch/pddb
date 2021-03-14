@@ -30,11 +30,13 @@ class pdvw(ABC):
     def init_obj(self) -> dict:
         pass
 
-    def __conv_args(self, *args, **kwargs) -> dict:
-        rtn = {}
+    def __conv_args(self, *args, **kwargs) -> list:
+        rtn = []
         for a in args:
             rtn = [a] if isinstance(a, dict) else a
             break
+        if rtn == []:
+            rtn = [kwargs]
         if kwargs != {}:
             nrtn = []
             for r in rtn:
@@ -42,6 +44,14 @@ class pdvw(ABC):
                 nrtn.append(r)
             rtn = nrtn
         return rtn
+
+    def filter(self, *args, **kwargs):
+        data = self.__conv_args(*args, **kwargs)
+        if data == []:
+            df = self._df()
+        else:
+            df = self._df(filt=data[0])
+        return df, [0]
 
     def upsert(self, *args, **kwargs):
         import copy
@@ -106,14 +116,21 @@ class pdvw(ABC):
                     return False
         return True
 
-    def _df(self) -> pd.DataFrame:
+    def _df(self, filt: dict = {}) -> pd.DataFrame:
+        fcols = [k for k, v in filt.items()]
         df = pd.DataFrame()
         for t in self._tbl:
             cols = [c.get("col")
                     for c in self._cols if c.get("tbl") == t.get("name")]
             jcols = t.get("join", [])
             cols += jcols
-            ndf = t.get("tbl")._df[cols]
+            nfilt = [c for c in cols if c in fcols]
+            if filt != {}:
+                tfilt = {k: v for k, v in filt.items() if k in nfilt}
+                ndf, _ = t.get("tbl").filter(tfilt)
+                ndf = ndf[cols]
+            else:
+                ndf = t.get("tbl")._df[cols]
             if df.empty:
                 df = ndf
             else:
