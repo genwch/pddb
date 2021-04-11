@@ -1,20 +1,48 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 from .columns import Column
+from enum import Enum
+
+
+class ACL(Enum):
+    PUBLIC = 0
+    SHARED = 1
+    PRIVATE = 2
 
 
 class pdtbl(ABC):
     def __init__(self, owner: str = "system", debug: bool = False):
-        (obj, path) = self.init_obj()
+        self.set_debug(debug)
+        (obj, path, acl) = self.init_obj()
         obj = self.__set_sys_obj(obj)
         self._obj = self.__obj2col(obj)
+        self._model = self.__obj2mod(self._obj)
         self._df = self.init_df(cols=[o.name for o in self._obj])
         self.__upddtm()
         self.set_owner(owner)
-        self.set_debug(debug)
         self._path = path
+        self._acl = acl
         self.load()
         pass
+
+    def __obj2mod(self, obj: dict):
+        from pydantic import create_model
+        from typing import Optional
+        fields = {}
+        for o in obj:
+            name = o.get("name")
+            type = o.get("type", str)
+            if o.get("optional", False):
+                type = Optional[type]
+                default = None
+                if self.debug:
+                    print(name, "optional", type)
+            else:
+                default = ...
+            fields[name] = (type, default)
+        model = create_model(self.__class__.__name__, **fields)
+        return model
+        # pass
 
     def set_owner(self, owner: str):
         self.owner = owner
@@ -77,28 +105,6 @@ class pdtbl(ABC):
             rtn = nrtn
         return rtn
 
-    def filter(self, *args, **kwargs) -> (pd.DataFrame, list):
-        df = kwargs.get("__df", pd.DataFrame())
-        df = self._df if df.empty else df
-        kwargs.update({"__gen_uuid": False})
-        kwargs.update({"__cur_dtm": False})
-        data = self.__prepare_data(*args, **kwargs)
-        for d in data:
-            for k, v in d.items():
-                df = df[df[k] == v]
-            break
-        return (df, df.index.to_list())
-
-    def isexists(self, *args, **kwargs) -> bool:
-        df = kwargs.get("__df", pd.DataFrame())
-        if not(df.empty):
-            df = self._df if df.empty else df
-            kwargs.update({"__df": df})
-        _, idx = self.filter(*args, **kwargs)
-        if idx == []:
-            return False
-        return True
-
     def check_require(self, data: dict) -> bool:
         for r in self.cols(attr="require"):
             if data.get(r, None) == None:
@@ -108,7 +114,7 @@ class pdtbl(ABC):
     def __set_uuid(self, data: dict) -> dict:
         import uuid
         for g in self.cols(attr="uuid"):
-            if data.get(g, None) == None:
+            if data.get(g, None) == None or data.get(g, None) == "":
                 data.update({g: str(uuid.uuid4())})
         return data
 
@@ -118,6 +124,21 @@ class pdtbl(ABC):
             val = data.get(g, None)
             if val != None:
                 data.update({g: hashlib.md5(val.encode()).hexdigest()})
+        return data
+
+    def __set_genrun(self, data: dict) -> dict:
+        for g in self.cols(attr="genrun"):
+            if data.get(g, None) == None or data.get(g, None) == "":
+                obj = [o for o in self._obj if o.get("name") == g][0]
+                nmask = obj.get("genrun_pattern").split("!!")
+                genpat = nmask[1].split("-")
+                if genpat[0] == "cnt":
+                    cnt = len(self._df)+1
+                    runnum = str(cnt).zfill(int(genpat[1]))
+                    val = "{}{}{}".format(nmask[0], runnum, nmask[2])
+                else:
+                    val = None
+                data.update({g: val})
         return data
 
     def __set_now(self, data: dict) -> dict:
@@ -134,6 +155,9 @@ class pdtbl(ABC):
                 data.update({g: self.owner})
         return data
 
+    def count(self) -> int:
+        return len(self._df)
+
     def __prepare_data(self, *args, **kwargs) -> list:
         data = self.__conv_args(*args, **kwargs)
         rtn = []
@@ -142,90 +166,122 @@ class pdtbl(ABC):
                 d = self.__set_uuid(data=d)
             if d.get("__mask_md5", True):
                 d = self.__set_md5(data=d)
+            if d.get("__genrun", True):
+                d = self.__set_genrun(data=d)
             if d.get("__cur_dtm", True):
                 d = self.__set_now(data=d)
                 d = self.__set_owner(data=d)
+            for o in self._obj:
+                d[o.get("name")] = d.get(o.get("name"), o.get("default", None))
             newd = {k: v for k, v in d.items() if k in self.cols()}
             rtn.append(newd)
         return rtn
 
-    def update(self, *args, **kwargs) -> bool:
+    def filter(self, filtcond: dict, filtowner=False) -> (list, int):
+        df = self._df
+        filt = filtcond.copy()
+        if filtowner:
+            filt.update({"upd_by": self.owner})
+        filtcol = [k for k, v in filt.items()]
+        for d in self.__prepare_data(filt):
+            data = d
+            break
+        filt = {k: v for k, v in data.items() if k in filtcol}
+        if self.debug:
+            print(f"filter - {self.to_dict(df)}, {filt}")
+        for k, v in filt.items():
+            df = df[df[k] == v]
+        if df.empty:
+            return (pd.DataFrame(), [])
+        return (df, df.index.to_list())
+
+    def select(self, filtcond: dict) -> (list):
+        filtowner = self.check_acl(issel=True)
+        df, _ = self.filter(filtcond=filtcond, filtowner=filtowner)
+        return df
+
+    def upsert(self, *args, **kwargs) -> (bool, list):
+        if kwargs.get("__upddtm", True):
+            self.__upddtm()
+        kwargs.update({"__upddtm": False})
+        data = self.__prepare_data(*args, **kwargs)
+        df = self._df
+        for d in data:
+            key = {k: v for k, v in d.items() if k in self.cols(attr="key")}
+            filt, idx = self.filter(key)
+            if idx == []:
+                if self.debug:
+                    print(f"upsert(ins) - {d}")
+                df = df.append(d, ignore_index=True)
+            else:
+                if self.debug:
+                    print(f"upsert(upd) - {d}")
+                filtowner = self.check_acl(isupd=True)
+                filt, idx = self.filter(key, filtowner=filtowner)
+                if idx == []:
+                    return False, None
+                else:
+                    for k, v in d.items():
+                        if k not in self.cols(attr="key") and k not in self.cols(attr="uuid") and k not in self.cols(attr="ignupd"):
+                            upd = pd.Series({i: v for i in idx})
+                            df[k].update(upd)
+        self._df = df
+        return True, data
+
+    def check_acl(self, isupd=False, issel=False) -> bool:
+        filtowner = True if self.owner != "system" else False
+        if self._acl == ACL.PUBLIC:
+            filtowner = False
+        if not(isupd):
+            if self._acl == ACL.SHARED:
+                filtowner = False
+        if not(issel):
+            if self._acl == ACL.PRIVATE:
+                filtowner = False
+        return filtowner
+
+    def update(self, *args, **kwargs) -> (bool, list):
         if kwargs.get("__upddtm", True):
             self.__upddtm()
         data = self.__prepare_data(*args, **kwargs)
         df = self._df
         for d in data:
-            if not(self.check_require(data=d)):
-                return False
-            filt = {k: v for k, v in d.items() if k in self.cols(attr="key")}
-            df_filt, idx = self.filter(filt)
+            key = {k: v for k, v in d.items() if k in self.cols(attr="key")}
+            filtowner = self.check_acl(isupd=True)
+            filt, idx = self.filter(key, filtowner=filtowner)
             if idx != []:
                 if self.debug:
-                    print(f"update {d}")
+                    print(f"update - {d}")
                 for k, v in d.items():
                     if k not in self.cols(attr="key") and k not in self.cols(attr="uuid") and k not in self.cols(attr="ignupd"):
                         upd = pd.Series({i: v for i in idx})
                         df[k].update(upd)
             else:
-                if self.debug:
-                    print("not found")
-                return False
+                return False, None
         self._df = df
-        return True
+        return True, data
 
-    def insert(self, *args, **kwargs) -> bool:
-        import copy
+    def insert(self, *args, **kwargs) -> (bool, list):
         if kwargs.get("__upddtm", True):
             self.__upddtm()
         data = self.__prepare_data(*args, **kwargs)
         df = self._df
         for d in data:
-            if not(self.check_require(data=d)):
-                return False
-            newd = copy.deepcopy(d)
-            newd.update({"__df": df})
-            exists = self.isexists(newd)
-            if not exists:
+            key = {k: v for k, v in d.items() if k in self.cols(attr="key")}
+            filt, idx = self.filter(key)
+            if idx == []:
                 if self.debug:
-                    print("insert", d)
+                    print(f"insert - {d}")
                 df = df.append(d, ignore_index=True)
             else:
-                if self.debug:
-                    print("exists")
-                return False
+                return False, None
         self._df = df
-        return True
-
-    def upsert(self, *args, **kwargs) -> bool:
-        self.__upddtm()
-        kwargs.update({"__upddtm": False})
-        kwargs.update({"__mask_md5": False})
-        data = self.__prepare_data(*args, **kwargs)
-        df = self._df
-        upd = []
-        ins = []
-        for d in data:
-            newd = {k: v for k, v in d.items() if k in self.cols(attr="key")}
-            if self.isexists(newd):
-                upd.append(d)
-            else:
-                ins.append(d)
-        if self.debug:
-            print(f"ins {ins}")
-        if not(self.insert(ins)):
-            self._df = df
-            return False
-        if self.debug:
-            print(f"upd {upd}")
-        if not(self.update(upd)):
-            self._df = df
-            return False
-        return True
+        return True, data
 
     def __repr__(self) -> dict:
         return self._df.to_dict("records")
 
-    def to_dict(self, df: pd.DataFrame) -> dict:
+    def to_dict(self, df: pd.DataFrame = pd.DataFrame()) -> dict:
         df = self._df if df.empty else df
         return df.to_dict("records")
 
